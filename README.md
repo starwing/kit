@@ -9,9 +9,9 @@ it can be used to simplifiy developing. kit offers:
   - a object pool implement
   - a hashtable implement
 
-routines ends with '_' are unchecked version. all objects newed by
-kit are recorded, and function such as kit_retain() will check
-whether a void* pointer is from kit. using kit_retain_() means you
+routines ends with `'_'` are unchecked version. all objects newed by
+kit are recorded, and function such as `kit_retain()` will check
+whether a `void*` pointer is from kit. using `kit_retain_()` means you
 sure the pointer is really from kit.
 
 kit is a single header library. just add kit.h to your project, and
