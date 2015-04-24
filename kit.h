@@ -22,13 +22,16 @@
 
 #include <stddef.h>
 
-#ifdef __cplusplus
-# define KIT_NS_BEGIN extern "C" {
-# define KIT_NS_END   }
-#else
-# define KIT_NS_BEGIN
-# define KIT_NS_END
-#endif
+#ifndef KIT_NS_BEGIN
+# ifdef __cplusplus
+#   define KIT_NS_BEGIN extern "C" {
+#   define KIT_NS_END   }
+# else
+#   define KIT_NS_BEGIN
+#   define KIT_NS_END
+# endif
+#endif /* KIT_NS_BEGIN */
+
 
 #if !defined(KIT_API) && defined(_WIN32)
 # ifdef KIT_IMPLEMENTATION
@@ -69,7 +72,6 @@ KIT_NS_BEGIN
 typedef struct kit_State  kit_State;
 typedef struct kit_Type   kit_Type;
 typedef struct kit_Symbol kit_Symbol;
-typedef struct kit_Seq    kit_Seq;
 typedef struct kit_Entry  kit_Entry;
 typedef        kit_Entry *kit_Table;
 typedef            void* *kit_Pool;
@@ -90,7 +92,21 @@ KIT_API kit_Panic *kit_getpanicf (kit_State *S, void **pud);
 KIT_API void       kit_panic     (kit_State *S, const char *msg);
 
 KIT_API size_t kit_sweep    (kit_State *S);
-KIT_API size_t kit_totalmem (kit_State *S); /* only useful when debug */
+
+
+/* kit raw memory routines */
+
+#define kit_newheader(S,sz,ht,et) \
+    ((ht*)(kit_malloc(S,sizeof(ht)+(sz)*sizeof(et))))
+#define kit_reallocheader(S,h,ns,os,ht,et) \
+    ((ht*)kit_realloc(S,h, sizeof(ht)+(ns)*sizeof(et), sizeof(ht)+(os)*sizeof(et)))
+#define kit_delheader(S,h,s,ht,et) \
+    (kit_free(S,h, sizeof(ht)+(s)*sizeof(et)))
+
+KIT_API size_t kit_totalmem (kit_State *S);
+KIT_API void  *kit_malloc   (kit_State *S, size_t size);
+KIT_API void  *kit_realloc  (kit_State *S, void *ptr, size_t newsize, size_t oldsize);
+KIT_API void   kit_free     (kit_State *S, void *ptr, size_t oldsize);
 
 
 /* kit types routines */
@@ -213,12 +229,12 @@ KIT_API unsigned kit_calchash (const char *s, size_t len);
 
 typedef struct kit_PoolHeader { /* all fields ro */
     size_t used;
-    size_t n;
+    size_t size;
 } kit_PoolHeader;
 
-#define kit_poolheader(P) ((kit_PoolHeader*)*(P)-1)
-#define kit_poolsize(P)   (!*(P) ? 0 : kit_poolheader(P)->n)
-#define kit_poolused(P)   (!*(P) ? 0 : kit_poolheader(P)->used)
+#define kit_poolheader(P) (*(kit_PoolHeader**)(P)-1)
+#define kit_poolsize(P)   (!*(kit_Pool*)(P) ? 0 : kit_poolheader(P)->size)
+#define kit_poolused(P)   (!*(kit_Pool*)(P) ? 0 : kit_poolheader(P)->used)
 
 #define kit_markobject(P,ptr)   (kit_mark_((P), kit_checkobject(ptr)))
 #define kit_unmarkobject(P,ptr) (kit_unmark_((P), kit_checkobject(ptr)))
@@ -239,7 +255,7 @@ KIT_API int    kit_ismarked (kit_Pool *p, void *ptr);
 
 typedef struct kit_TableHeader { /* all fields ro */
     kit_Entry *lastfree;
-    size_t n;
+    size_t size;
 } kit_TableHeader;
 
 struct kit_Entry {
@@ -248,8 +264,8 @@ struct kit_Entry {
     void *value;     /* rw */
 };
 
-#define kit_tableheader(T)      ((kit_TableHeader*)*(T)-1)
-#define kit_tablesize(T)        (!*(T) ? 0 : kit_tableheader(T)->n)
+#define kit_tableheader(T)      (*(kit_TableHeader**)(T)-1)
+#define kit_tablesize(T)        (!*(kit_Table*)(T) ? 0 : kit_tableheader(T)->size)
 #define kit_getfield(T,K)       (kit_gettable((T), KIT_S(K)))
 #define kit_setfield(T,K,V)     kit_setreftable(T, KIT_S(K), V)
 #define kit_setreftable(T,K,V)  kit_setobject(kit_settable((T),(K))->value, V)
@@ -274,7 +290,8 @@ KIT_NS_END
 
 /* implementations */
 
-#ifdef KIT_IMPLEMENTATION
+#if defined(KIT_IMPLEMENTATION) && !defined(KIT_HAS_IMPLEMENTATION)
+#define KIT_HAS_IMPLEMENTATION
 
 
 #include <stdio.h>
@@ -345,7 +362,7 @@ KIT_API kit_State *kit_default_state;
 
 typedef struct kit_SymbolPool {
     kit_SymbolHeader **hash;
-    size_t n;
+    size_t size;
 } kit_SymbolPool;
 
 struct kit_State {
@@ -378,19 +395,14 @@ static void kitG_outofmemory(kit_State *S)
 static void *kitG_alloc(kit_State *S, void *ptr, size_t newsize, size_t oldsize) {
     (void)S; (void)oldsize; /* not used */
     if (newsize == 0) {
-        KIT_DEBUG_STMT(S->totalmem -= oldsize);
         free(ptr);
         return NULL;
     }
-    KIT_DEBUG_STMT(S->totalmem += newsize);
-    KIT_DEBUG_STMT(if (ptr) S->totalmem -= oldsize);
     return realloc(ptr, newsize);
 }
 
 static void **kitG_newarray(kit_State *S, size_t sz) {
-    kit_ObjectHeader *h = (kit_ObjectHeader*)S->alloc(S, NULL,
-            sizeof(kit_ObjectHeader) + sz*sizeof(void*), KIT_TIDX_REF);
-    if (h == NULL) kitG_outofmemory(S);
+    kit_ObjectHeader *h = kit_newheader(S, sz, kit_ObjectHeader, void*);
     h->type_id = KIT_TIDX_REF;
     h->ref = KIT_STAIC_OBJECT;
     h->len = sz;
@@ -402,10 +414,8 @@ static void **kitG_resizearray(kit_State *S, void **ptr, size_t newsize) {
     void **newptr;
     kit_ObjectHeader *h = kit_objectheader_(ptr);
     size_t oldsize = h->len;
-    kit_ObjectHeader *nh = (kit_ObjectHeader*)S->alloc(S, h,
-            sizeof(kit_ObjectHeader) + newsize*sizeof(void*),
-            sizeof(kit_ObjectHeader) + oldsize*sizeof(void*));
-    if (nh == NULL) kitG_outofmemory(S);
+    kit_ObjectHeader *nh = kit_reallocheader(S, h, newsize, oldsize,
+            kit_ObjectHeader, void*);
     nh->len = newsize;
     newptr = (void**)((kit_ObjectHeader*)nh+1);
     if (newsize > oldsize)
@@ -415,7 +425,28 @@ static void **kitG_resizearray(kit_State *S, void **ptr, size_t newsize) {
 
 static void kitG_freearray(kit_State *S, void **ptr) {
     kit_ObjectHeader *h = kit_objectheader_(ptr);
-    S->alloc(S, h, 0, sizeof(kit_ObjectHeader) + h->len*sizeof(void*));
+    kit_delheader(S, h, h->len, kit_ObjectHeader, void*);
+}
+
+KIT_API void *kit_malloc(kit_State *S, size_t size) {
+    void *ptr = S->alloc(S, NULL, size, 0);
+    if (ptr == NULL) kitG_outofmemory(S);
+    S->totalmem += size;
+    return ptr;
+}
+
+KIT_API void *kit_realloc(kit_State *S, void *ptr, size_t newsize, size_t oldsize) {
+    void *newptr = S->alloc(S, ptr, newsize, oldsize);
+    if (newptr == NULL) kitG_outofmemory(S);
+    S->totalmem += newsize;
+    S->totalmem -= oldsize;
+    return ptr;
+}
+
+KIT_API void kit_free(kit_State *S, void *ptr, size_t oldsize) {
+    void *newptr = S->alloc(S, ptr, 0, oldsize);
+    kit_assert(newptr == NULL);
+    S->totalmem -= oldsize;
 }
 
 
@@ -440,12 +471,10 @@ static kit_Pool kitP_new(kit_State *S, size_t size) {
     kit_PoolHeader *h;
     kit_Pool p;
     size = kitH_calcsize(size);
-    h = (kit_PoolHeader*)S->alloc(S, NULL, sizeof(kit_PoolHeader) +
-            size*sizeof(void*), 0);
-    if (h == NULL) kitG_outofmemory(S);
+    h = kit_newheader(S, size, kit_PoolHeader, void*);
     p = (void**)(h + 1);
     h->used = 0;
-    h->n = size;
+    h->size = size;
     memset(p, 0, size*sizeof(void*));
     return p;
 }
@@ -453,8 +482,7 @@ static kit_Pool kitP_new(kit_State *S, size_t size) {
 static void kitP_delete(kit_State *S, kit_Pool p) {
     if (p != NULL) {
         kit_PoolHeader *h = kit_poolheader(&p);
-        S->alloc(S, h, 0, sizeof(kit_PoolHeader) +
-                h->n*sizeof(void*));
+        kit_delheader(S, h, h->size, kit_PoolHeader, void*);
     }
 }
 
@@ -790,7 +818,7 @@ static unsigned kitS_calchash(const char *s, size_t len, unsigned seed) {
 
 static void kitS_initpool(kit_State *S, kit_SymbolPool *p, size_t size) {
     p->hash = (kit_SymbolHeader**)kitG_newarray(S, size);
-    p->n = 0;
+    p->size = 0;
 }
 
 static void kitS_resize(kit_State *S, kit_SymbolPool *p, size_t size) {
@@ -836,13 +864,13 @@ static kit_Symbol *kitS_new(kit_SymbolPool *p, const char *str, size_t len, unsi
     char *sym = (char*)kit_newarray_(KIT_TP(SYMBOL), len+1);
     memcpy(sym, str, len);
     sym[len] = '\0';
-    if (kit_len_(p->hash) < p->n)
-        kitS_resize(kit_state(), p, p->n + 1);
+    if (kit_len_(p->hash) < p->size)
+        kitS_resize(kit_state(), p, p->size + 1);
     h = kit_symbolheader_(sym);
     h->hash = hash;
     h->next = *list;
     *list = h;
-    ++p->n;
+    ++p->size;
     return (kit_Symbol*)(h+1);
 }
 
@@ -852,10 +880,10 @@ static size_t kitS_delete(kit_SymbolPool *p, kit_Symbol *s) {
             h->h.len-1, h->hash);
     if (v && *v == h) {
         *v = (*v)->next; /* delete symbol from table */
-        return --p->n;
+        return --p->size;
     }
     kit_assert(!"symbol s not in pool!");
-    return p->n;
+    return p->size;
 }
 
 KIT_API kit_Symbol *kit_lsymbol(const char *str, size_t len) {
@@ -958,8 +986,8 @@ static kit_Entry *getnewentry(kit_Table *t, void *key) {
     mp = &hash[kitH_calchash(key) & mask];
     if (mp == NULL || mp->key != NULL) { /* main position is taken? */
         kit_Entry *othern;
-        kit_Entry *n = getfreepos(h, hash); /* get a free place */
-        if (n == NULL) { /* can not find a free place? */
+        kit_Entry *entry = getfreepos(h, hash); /* get a free place */
+        if (entry == NULL) { /* can not find a free place? */
             kit_resizetable(t, len+1); /* grow table */
             return getnewentry(t, key);
         }
@@ -967,15 +995,15 @@ static kit_Entry *getnewentry(kit_Table *t, void *key) {
         if (othern != mp) { /* is colliding node out of its main position? */
             /* yes; move colliding node into free position */
             while (othern->next != mp) othern = othern->next; /* find previous */
-            othern->next = n; /* redo the chain whth `n' in place of `mp' */
-            *n = *mp; /* copy colliding node into free pos (mp->next also goes) */
+            othern->next = entry; /* redo the chain whth `entry' in place of `mp' */
+            *entry = *mp; /* copy colliding node into free pos (mp->next also goes) */
             mp->next = NULL; /* now `mp' is free */
         }
         else { /* colliding node is in its own main position */
             /* new node will go into free position */
-            n->next = mp->next;
-            mp->next = n;
-            mp = n;
+            entry->next = mp->next;
+            mp->next = entry;
+            mp = entry;
         }
     }
     kit_retain(key); /* checked */
@@ -988,12 +1016,10 @@ static kit_Table kitH_new(kit_State *S, size_t size) {
     kit_TableHeader *h;
     kit_Table t;
     size = kitH_calcsize(size);
-    h = (kit_TableHeader*)S->alloc(S, NULL, sizeof(kit_TableHeader) +
-            size*sizeof(kit_Entry), 0);
-    if (h == NULL) kitG_outofmemory(S);
+    h = kit_newheader(S, size, kit_TableHeader, kit_Entry);
     t = (kit_Entry*)(h + 1);
     h->lastfree = &t[size - 1];
-    h->n = size;
+    h->size = size;
     memset(t, 0, size*sizeof(kit_Entry));
     return t;
 }
@@ -1001,8 +1027,7 @@ static kit_Table kitH_new(kit_State *S, size_t size) {
 static void kitH_delete(kit_State *S, kit_Table t) {
     if (t != NULL) {
         kit_TableHeader *h = kit_tableheader(&t);
-        S->alloc(S, h, 0, sizeof(kit_TableHeader) +
-                h->n*sizeof(kit_Entry));
+        kit_delheader(S, h, h->size, kit_TableHeader, kit_Entry);
     }
 }
 
@@ -1309,7 +1334,7 @@ KIT_API void kit_close(kit_State *S) {
     kitS_cleanup(S);
     kitT_cleanup(S);
     kit_setstate(oldS);
-    KIT_DEBUG_STMT(kit_assert(S->totalmem == 0));
+    kit_assert(S->totalmem == 0);
     if (S == kit_current_state)
         kit_current_state = NULL;
     if (S == kit_default_state)

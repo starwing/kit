@@ -1,6 +1,7 @@
 #define KIT_DEBUG
 #define KIT_IMPLEMENTATION
 #include "kit.h"
+#include "kit_variant.h"
 
 #include <assert.h>
 #include <stdio.h>
